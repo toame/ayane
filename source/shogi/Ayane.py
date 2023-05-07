@@ -1271,6 +1271,8 @@ class GameKifu:
         # 試合結果
         self.game_result = None  # GameResult
 
+        self.is_player1_win = False
+
 
 class EloRating:
     def __init__(self):
@@ -1317,7 +1319,7 @@ class EloRating:
 
         # 引き分け以外の有効な試合数
         total = float(self.player1_win + self.player2_win)
-
+        
         if total != 0:
             # 普通の勝率
             self.win_rate = self.player1_win / total
@@ -1408,6 +1410,70 @@ class EloRating:
         p0 = EloRating.solve_hypothesis_testing(1 - r, n)
         return -EloRating.calc_rating(p0)
 
+import numpy as np
+from scipy.optimize import minimize
+class MultiEloRating:
+    def __init__(self):
+        self.players = 0
+        self.matches = np.empty((0, 4), int)    
+        self.ratings = []
+
+    def get_matches(self):
+        # players * playersの二次元配列を作る
+        matches_2d = np.zeros((self.players, self.players), int)
+        for i, j, wins, losses in self.matches:
+            matches_2d[i][j] += wins
+            matches_2d[j][i] += losses
+        self.matches = np.empty((0, 4), int)  
+        for i in range(self.players):
+            for j in range(self.players):
+                # 桁数を揃えるために、3桁で表示
+                print(str(matches_2d[i][j]).zfill(3), end=" ")
+                if i < j and matches_2d[i][j] + matches_2d[j][i] > 0:
+                    self.matches = np.append(self.matches, [[i, j, matches_2d[i][j], matches_2d[j][i]]], axis=0)
+            print()
+        
+        
+
+    def rating_log_likelihood(self, ratings, matches):
+        log_likelihood = 0
+        for i, j, wins, losses in matches:
+            log_likelihood += wins * np.log(1 + 10 ** (-(ratings[i] - ratings[j]) / 400))
+            log_likelihood += losses * np.log(1 + 10 ** (-(ratings[j] - ratings[i]) / 400))
+        return log_likelihood
+
+    def calculate_ratings(self, matches):
+        initial_ratings = [1500] * self.players
+        result = minimize(self.rating_log_likelihood, initial_ratings, args=(matches,))
+        return result.x
+
+    def simulate_match(self, rating1, rating2):
+        prob = 1 / (1 + 10 ** ((rating2 - rating1) / 400))
+        return np.random.rand() < prob
+
+    def monte_carlo_uncertainty(self, ratings, matches, n_simulations=5):
+        rating_samples = []
+        for _ in range(n_simulations):
+            simulated_matches = np.zeros_like(matches)
+            for i, (player1, player2, wins, losses) in enumerate(matches):
+                simulated_wins = 0
+                for _ in range(wins + losses):
+                    if self.simulate_match(ratings[player1], ratings[player2]):
+                        simulated_wins += 1
+                simulated_losses = wins + losses - simulated_wins
+                simulated_matches[i] = [player1, player2, simulated_wins, simulated_losses]
+            rating_samples.append(self.calculate_ratings(simulated_matches))
+        
+        rating_samples = np.array(rating_samples)
+        uncertainties = np.std(rating_samples, axis=0)
+        return uncertainties
+
+    def calc_ratings(self):
+        self.ratings = self.calculate_ratings(self.matches)
+        # self.uncertainties = self.monte_carlo_uncertainty(self.ratings, self.matches)
+
+        print("Ratings:", [int(rating) for rating in self.ratings])
+        # print("Uncertainties:", [int(uncertainty) for uncertainty in self.uncertainties])
 
 # 並列自己対局のためのクラス
 class MultiAyaneruServer:
@@ -1577,6 +1643,7 @@ class MultiAyaneruServer:
         kifu.sfen = server.sfen
         kifu.flip_turn = server.flip_turn
         kifu.game_result = server.game_result
+        kifu.is_player1_win = result.is_player1_win(server.flip_turn)
         self.game_kifus.append(kifu)
 
     # 対局サーバーを開始する。
@@ -1610,7 +1677,7 @@ if __name__ == "__main__":
     # 最低限のテスト用コード
     usi = UsiEngine()
     usi.debug_print = True
-    usi.connect("exe/YaneuraOu.exe")
+    usi.connect("exe/YaneuraOu_NNUE-tournament-clang++-avx2.exe")
     print(usi.engine_path)
     usi.usi_position("startpos moves 7g7f")
     print("moves = " + usi.get_moves())

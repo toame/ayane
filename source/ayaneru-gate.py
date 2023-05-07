@@ -73,7 +73,7 @@ import time
 import argparse
 import random
 import shogi.Ayane as ayane
-
+import numpy as np
 
 # エンジンに関する情報構造体
 class EngineInfo:
@@ -207,7 +207,7 @@ def AyaneruGate():
     parser.add_argument(
         "--time",
         type=str,
-        default="byoyomi 100",
+        default="time 6000000",
         help="持ち時間設定 AyaneruServer.set_time_setting()の引数と同じ。",
     )
 
@@ -216,15 +216,15 @@ def AyaneruGate():
 
     # イテレーション回数
     parser.add_argument(
-        "--iteration", type=int, default=10, help="number of iterations"
+        "--iteration", type=int, default=1000, help="number of iterations"
     )
 
     # 対局回数
-    parser.add_argument("--loop", type=int, default=10, help="number of games")
+    parser.add_argument("--loop", type=int, default=20, help="number of games")
 
     # CPUコア数
     parser.add_argument(
-        "--cores", type=int, default=8, help="cpu cores(number of logical threads)"
+        "--cores", type=int, default=6, help="cpu cores(number of logical threads)"
     )
 
     # flip_turn
@@ -242,7 +242,7 @@ def AyaneruGate():
 
     # start_gameply
     parser.add_argument(
-        "--start_gameply", type=int, default=24, help="start game ply in the book"
+        "--start_gameply", type=int, default=16, help="start game ply in the book"
     )
 
     args = parser.parse_args()
@@ -284,7 +284,20 @@ def AyaneruGate():
         for i, engine_info in enumerate(engine_infos):
             print("== Engine {0} ==".format(i))
             engine_info.print()
+    
+    # engineネームをintに解釈してsortする。
+    engine_infos.sort(key=lambda x: int(x.engine_folder))
 
+    multielorating = ayane.MultiEloRating()
+    multielorating.players = len(engine_infos)
+    multielorating.ratings = [1500] * multielorating.players
+    if os.path.isfile('matches.txt'):
+        print("File loaded matches.txt")
+        multielorating.matches = np.loadtxt('matches.txt',dtype=int,delimiter=',',ndmin=2)
+        multielorating.get_matches()
+        np.savetxt('matches.txt',multielorating.matches,fmt='%d',delimiter=',')
+        multielorating.calc_ratings()
+    
     # レーティングが変動するエンジンが少なくとも2つないと意味がない。
     non_fixed_rating_engines = 0
     for info in engine_infos:
@@ -313,7 +326,6 @@ def AyaneruGate():
 
     # サーバーを一つ起動して、任意の2エンジンで100対局ほど繰り返して、レーティングを変動させる。
     # あとは、それをloop回数だけ繰り返す。
-
     for it in range(args.iteration):
         log.print("iteration : {0}".format(it), output_datetime=True)
 
@@ -338,6 +350,25 @@ def AyaneruGate():
             if p1 > p2:
                 p1, p2 = p2, p1
                 # pythonのswapテクニック
+
+            player1_rating = multielorating.ratings[p1]
+            player2_rating = multielorating.ratings[p2]
+
+            # engine番号が大きいほど、時間がかかる設定にしている。
+            # このため、engine番号が大きいほど、選ばれにくくする。
+            estimate_time = 2 ** (p1/2.5) + 2 ** (p2/2.5)
+            rand_num = random.random()
+            if rand_num > 2.4/estimate_time:
+                continue
+            print("estimate_time", p1, p2, estimate_time, 2.4/estimate_time, rand_num)
+
+            # レーティング差が離れているほど、対局確率を下げる。
+            # 正規乱数を用いて、レーティング差が大きいほど、対局確率を下げる。
+            rating_diff = abs(player1_rating - player2_rating)
+            rand_num = abs(random.gauss(0, 150)) + 150
+            print("rating_diff", player1_rating, player2_rating, rating_diff, rand_num)
+            if rating_diff > rand_num:
+                continue
 
             info1 = engine_infos[p1]
             info2 = engine_infos[p2]
@@ -370,14 +401,15 @@ def AyaneruGate():
         thread_total = max(thread1, thread2)
         # 何並列で対局するのか？ 2スレほど余らせておかないとtimeupになるかもしれん。
         # メモリが足りるかは知らん。メモリ足りないとこれまたメモリスワップでtimeupになる。
-        cores = max(args.cores - 2, 1)
-        game_server_num = int(cores / thread_total)
+        # cores = max(args.cores - 2, 1)
+        game_server_num = 2
 
         # あやねるサーバーを起動
         server.init_server(game_server_num)
 
         # エンジンオプション
         options_common = {
+            "USI_hash": "512",
             "NetworkDelay": "0",
             "NetworkDelay2": "0",
             "MaxMovesToDraw": "320",
@@ -448,7 +480,13 @@ def AyaneruGate():
             )
 
         # 対局が終わったのでレーティングの移動を行う
+        
         elo = server.game_rating()
+        new_row = np.array([p1, p2, elo.player1_win, elo.player2_win])
+        multielorating.matches = np.append(multielorating.matches, [new_row], axis=0)
+        np.savetxt('matches.txt', multielorating.matches, fmt='%d', delimiter=',') 
+        # print(multielorating.matches)
+        multielorating.calc_ratings()
 
         # 1P側は2P側よりどれだけ勝るか。
         # 完勝のときは+無限大扱いでいいと思う。(以下でclipするので)
@@ -467,28 +505,31 @@ def AyaneruGate():
         else:
             player1_add = +int(rating_diff / 2)
             player2_add = -int(rating_diff / 2)
-
+        next_player1 = int(multielorating.ratings[p1] + 0.5)
+        next_player2 = int(multielorating.ratings[p2] + 0.5)
         log.print(
             "Player1 : {0} , rating {1} -> {2}".format(
-                info1.engine_display_name, info1.rating, info1.rating + player1_add
+                info1.engine_display_name, info1.rating, next_player1
             ),
             also_print=True,
         )
         log.print(
             "Player2 : {0} , rating {1} -> {2}".format(
-                info2.engine_display_name, info2.rating, info2.rating + player2_add
+                info2.engine_display_name, info2.rating, next_player2
             ),
             also_print=True,
         )
 
-        info1.rating += player1_add
-        info2.rating += player2_add
+        info1.rating = next_player1
+        info2.rating = next_player2
 
         # レーティングが変動したのなら、エンジン設定ファイルに書き戻す
         if player1_add != 0:
             info1.write_engine_define(home)
         if player2_add != 0:
             info2.write_engine_define(home)
+
+               
 
     # iteration回数だけ繰り返したので終了する。
     output_engine_rating()
